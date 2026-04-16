@@ -1,146 +1,151 @@
 #!/usr/bin/env node
 /**
- * M365 Assistant MCP Server - Main entry point
- *
- * A Model Context Protocol server that provides access to
- * Microsoft 365 services (Outlook, OneDrive, Power Automate)
- * through the Microsoft Graph API and Flow API.
+ * CCR Outlook MCP Server — HTTP (StreamableHTTP) transport for Railway.
+ * App-only Microsoft Graph auth via MSAL client credentials.
  */
-const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
-const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
-const config = require('./config');
+const express = require('express');
+const cors = require('cors');
+const { randomUUID } = require('crypto');
+const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
+const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 
-// Import module tools
-const { authTools } = require('./auth');
-const { calendarTools } = require('./calendar');
+const config = require('./config');
+const { runWithContext } = require('./utils/context');
+
 const { emailTools } = require('./email');
 const { folderTools } = require('./folder');
 const { rulesTools } = require('./rules');
-const { onedriveTools } = require('./onedrive');
-const { powerAutomateTools } = require('./power-automate');
 
-// Log startup information
-console.error(`STARTING ${config.SERVER_NAME.toUpperCase()} MCP SERVER`);
-console.error(`Test mode is ${config.USE_TEST_MODE ? 'enabled' : 'disabled'}`);
+const TOOLS = [...emailTools, ...folderTools, ...rulesTools];
 
-// Combine all tools
-const TOOLS = [
-  ...authTools,
-  ...calendarTools,
-  ...emailTools,
-  ...folderTools,
-  ...rulesTools,
-  ...onedriveTools,
-  ...powerAutomateTools
-];
+console.error(`STARTING ${config.SERVER_NAME.toUpperCase()} v${config.SERVER_VERSION}`);
+console.error(`Default mailbox: ${config.DEFAULT_MAILBOX}`);
+console.error(`Tools registered: ${TOOLS.map((t) => t.name).join(', ')}`);
 
-// Create server with tools capabilities
-const server = new Server(
-  { name: config.SERVER_NAME, version: config.SERVER_VERSION },
-  {
-    capabilities: {
-      tools: {}
-    }
-  }
-);
+function buildServer() {
+  const server = new Server(
+    { name: config.SERVER_NAME, version: config.SERVER_VERSION },
+    { capabilities: { tools: {} } }
+  );
 
-// Handle all requests
-server.fallbackRequestHandler = async (request) => {
-  try {
+  server.fallbackRequestHandler = async (request) => {
     const { method, params, id } = request;
     console.error(`REQUEST: ${method} [${id}]`);
-    
-    // Initialize handler
-    if (method === "initialize") {
-      console.error(`INITIALIZE REQUEST: ID [${id}]`);
+
+    if (method === 'initialize') {
       return {
-        protocolVersion: "2025-11-25",
-        capabilities: {
-          tools: {}
-        },
-        serverInfo: { name: config.SERVER_NAME, version: config.SERVER_VERSION }
+        protocolVersion: '2025-06-18',
+        capabilities: { tools: {} },
+        serverInfo: { name: config.SERVER_NAME, version: config.SERVER_VERSION },
       };
     }
-    
-    // Tools list handler
-    if (method === "tools/list") {
-      console.error(`TOOLS LIST REQUEST: ID [${id}]`);
-      console.error(`TOOLS COUNT: ${TOOLS.length}`);
-      console.error(`TOOLS NAMES: ${TOOLS.map(t => t.name).join(', ')}`);
-      
+
+    if (method === 'tools/list') {
       return {
-        tools: TOOLS.map(tool => ({
-          name: tool.name,
-          description: tool.description,
-          inputSchema: tool.inputSchema
-        }))
+        tools: TOOLS.map((t) => ({
+          name: t.name,
+          description: t.description,
+          inputSchema: t.inputSchema,
+        })),
       };
     }
-    
-    // Required empty responses for other capabilities
-    if (method === "resources/list") return { resources: [] };
-    if (method === "prompts/list") return { prompts: [] };
-    
-    // Tool call handler
-    if (method === "tools/call") {
+
+    if (method === 'resources/list') return { resources: [] };
+    if (method === 'prompts/list') return { prompts: [] };
+
+    if (method === 'tools/call') {
       try {
         const { name, arguments: args = {} } = params || {};
-        
-        console.error(`TOOL CALL: ${name}`);
-        
-        // Find the tool handler
-        const tool = TOOLS.find(t => t.name === name);
-        
-        if (tool && tool.handler) {
-          return await tool.handler(args);
+        const tool = TOOLS.find((t) => t.name === name);
+        if (!tool || !tool.handler) {
+          return { error: { code: -32601, message: `Tool not found: ${name}` } };
         }
-        
-        // Tool not found
-        return {
-          error: {
-            code: -32601,
-            message: `Tool not found: ${name}`
-          }
-        };
+        // Run the handler inside the per-request mailbox context so graph-api.js
+        // rewrites `me/...` → `users/{mailbox}/...` correctly.
+        return await runWithContext({ mailbox: args.mailbox }, () => tool.handler(args));
       } catch (error) {
-        console.error(`Error in tools/call:`, error);
-        return {
-          error: {
-            code: -32603,
-            message: `Error processing tool call: ${error.message}`
-          }
-        };
+        console.error('Error in tools/call:', error);
+        return { error: { code: -32603, message: `Error processing tool call: ${error.message}` } };
       }
     }
-    
-    // For any other method, return method not found
-    return {
-      error: {
-        code: -32601,
-        message: `Method not found: ${method}`
-      }
-    };
-  } catch (error) {
-    console.error(`Error in fallbackRequestHandler:`, error);
-    return {
-      error: {
-        code: -32603,
-        message: `Error processing request: ${error.message}`
-      }
-    };
-  }
-};
 
-// Make the script executable
-process.on('SIGTERM', () => {
-  console.error('SIGTERM received but staying alive');
+    return { error: { code: -32601, message: `Method not found: ${method}` } };
+  };
+
+  return server;
+}
+
+const app = express();
+app.use(cors({ origin: '*', exposedHeaders: ['mcp-session-id'] }));
+app.use(express.json({ limit: '4mb' }));
+
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    server: config.SERVER_NAME,
+    version: config.SERVER_VERSION,
+    defaultMailbox: config.DEFAULT_MAILBOX,
+    tools: TOOLS.length,
+  });
 });
 
-// Start the server
-const transport = new StdioServerTransport();
-server.connect(transport)
-  .then(() => console.error(`${config.SERVER_NAME} connected and listening`))
-  .catch(error => {
-    console.error(`Connection error: ${error.message}`);
-    process.exit(1);
+app.get('/', (_req, res) => {
+  res.type('text/plain').send(
+    `${config.SERVER_NAME} v${config.SERVER_VERSION}\n` +
+      `MCP endpoint: POST /mcp\n` +
+      `Health: GET /health\n` +
+      `Default mailbox: ${config.DEFAULT_MAILBOX}\n`
+  );
+});
+
+// Stateless mode: every POST spins up a fresh Server+Transport pair. Simpler and
+// resilient across Railway autoscale/redeploys than session-ID stickiness.
+app.post('/mcp', async (req, res) => {
+  try {
+    const server = buildServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+    });
+    res.on('close', () => {
+      transport.close();
+      server.close();
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('MCP request error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+        id: null,
+      });
+    }
+  }
+});
+
+app.get('/mcp', (_req, res) => {
+  res.status(405).json({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Method Not Allowed. Use POST for MCP requests.' },
+    id: null,
   });
+});
+
+app.delete('/mcp', (_req, res) => {
+  res.status(405).json({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Method Not Allowed.' },
+    id: null,
+  });
+});
+
+const PORT = config.PORT;
+app.listen(PORT, '0.0.0.0', () => {
+  console.error(`${config.SERVER_NAME} listening on 0.0.0.0:${PORT}`);
+});
+
+process.on('SIGTERM', () => {
+  console.error('SIGTERM received; exiting.');
+  process.exit(0);
+});
